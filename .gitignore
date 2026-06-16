@@ -1,0 +1,19 @@
+# Model weights — download automatically on first run
+*.pt
+*.pth
+*.onnx
+
+# Data and output
+data/
+output/
+*.mp4
+*.avi
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Misc
+.DS_Store
