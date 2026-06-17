@@ -9,6 +9,8 @@ YOUTUBE_URL = "https://www.youtube.com/watch?v=zQ5x1AlImTI"
 FRAME_W = 1920
 FRAME_H = 1080
 INFER_SIZE = 1280
+DISPLAY_W = 1280
+DISPLAY_H = 720
 
 # FIFA center circle diameter: 9.15m radius = 18.3m diameter
 CENTER_CIRCLE_D_M = 18.3
@@ -38,6 +40,46 @@ def make_kalman(dt):
     kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * MEAS_NOISE
     kf.errorCovPost = np.eye(4, dtype=np.float32) * 100
     return kf
+
+
+# Search radius around Kalman prediction (pixels, in full-frame space)
+BLOB_SEARCH_R = 120
+# Ball diameter bounds in full-frame pixels — aerial balls appear smaller
+BLOB_MIN_R = 4
+BLOB_MAX_R = 30
+
+
+def blob_search(frame, pred_x, pred_y):
+    """Look for a bright, circular blob near (pred_x, pred_y) in full-frame space.
+    Returns (cx, cy) in full-frame coords, or (None, None) if nothing plausible found."""
+    h, w = frame.shape[:2]
+    x1 = max(0, pred_x - BLOB_SEARCH_R)
+    y1 = max(0, pred_y - BLOB_SEARCH_R)
+    x2 = min(w, pred_x + BLOB_SEARCH_R)
+    y2 = min(h, pred_y + BLOB_SEARCH_R)
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None, None
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    # Blur to suppress noise before thresholding
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    circles = cv2.HoughCircles(
+        blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=20,
+        param1=50, param2=12,
+        minRadius=BLOB_MIN_R, maxRadius=BLOB_MAX_R
+    )
+    if circles is not None:
+        # Pick the circle whose center is closest to the Kalman prediction
+        best, best_d = None, float("inf")
+        for cx, cy, r in circles[0]:
+            d = (cx - BLOB_SEARCH_R) ** 2 + (cy - BLOB_SEARCH_R) ** 2
+            if d < best_d:
+                best_d = d
+                best = (int(cx + x1), int(cy + y1))
+        if best is not None:
+            return best[0], best[1]
+    return None, None
 
 
 class VideoStream:
@@ -78,7 +120,8 @@ class VideoStream:
 
 def calibrate(stream):
     """Click left then right edge of the center circle to set pixels-per-meter.
-    Center circle diameter = 18.3m. Works on any shot that shows the center circle."""
+    Center circle diameter = 18.3m. Works on any shot that shows the center circle.
+    SPACE to pause/resume. R to reset clicks."""
     clicks = []
 
     def on_click(event, x, y, flags, param):
@@ -88,36 +131,66 @@ def calibrate(stream):
                 print(f"  click {len(clicks)}: x={x}")
 
     cv2.namedWindow("Calibrate", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Calibrate", DISPLAY_W, DISPLAY_H)
     cv2.setMouseCallback("Calibrate", on_click)
-    print("CALIBRATION: wait for a shot showing the center circle.")
-    print("Click LEFT edge of center circle, then RIGHT edge.")
+    print("CALIBRATION: press SPACE to pause on a frame showing the center circle.")
+    print("Click LEFT edge then RIGHT edge. R to reset. Q to quit.")
 
     frame = None
+    frozen_frame = None
+    paused = False
+
     while len(clicks) < 2:
-        new_frame = stream.read()
-        if new_frame is not None:
-            frame = new_frame.copy()
+        if not paused:
+            new_frame = stream.read()
+            if new_frame is not None:
+                frame = new_frame.copy()
         if frame is None:
+            cv2.waitKey(16)
             continue
-        disp = frame.copy()
-        msg = "Click LEFT edge of center circle" if len(clicks) == 0 else "Now click RIGHT edge of center circle"
-        cv2.putText(disp, msg, (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+
+        disp = (frozen_frame if paused else frame).copy()
+
+        if paused:
+            if len(clicks) == 0:
+                msg = "PAUSED — click LEFT edge of center circle"
+            else:
+                msg = "PAUSED — click RIGHT edge of center circle"
+            status_color = (0, 200, 255)
+        else:
+            msg = "LIVE — SPACE to pause  |  R to reset"
+            status_color = (0, 255, 100)
+
+        cv2.putText(disp, msg, (40, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
         cv2.putText(disp, f"clicks: {len(clicks)}/2", (40, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
         for cx in clicks:
             cv2.line(disp, (cx, 0), (cx, disp.shape[0]), (0, 255, 0), 2)
         cv2.imshow("Calibrate", disp)
-        cv2.waitKey(16)
 
-    cv2.setMouseCallback("Calibrate", lambda *a: None)  # stop accepting clicks
+        key = cv2.waitKey(16) & 0xFF
+        if key == ord(' '):
+            paused = not paused
+            if paused and frame is not None:
+                frozen_frame = frame.copy()
+        elif key == ord('r'):
+            clicks.clear()
+            frozen_frame = None
+            paused = False
+            print("  clicks reset")
+        elif key == ord('q'):
+            cv2.destroyWindow("Calibrate")
+            raise SystemExit("Calibration cancelled.")
+
+    cv2.setMouseCallback("Calibrate", lambda *a: None)
 
     pixel_width = abs(clicks[1] - clicks[0])
     ppm = pixel_width / CENTER_CIRCLE_D_M
     print(f"Center circle spans {pixel_width}px = {CENTER_CIRCLE_D_M}m  =>  {ppm:.2f} px/m")
 
-    disp = frame.copy()
-    cv2.putText(disp, f"Calibrated: {ppm:.2f} px/m", (40, 60),
+    final = (frozen_frame if frozen_frame is not None else frame).copy()
+    cv2.putText(final, f"Calibrated: {ppm:.2f} px/m", (40, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-    cv2.imshow("Calibrate", disp)
+    cv2.imshow("Calibrate", final)
     cv2.waitKey(1500)
     cv2.destroyWindow("Calibrate")
     return ppm
@@ -126,7 +199,7 @@ def calibrate(stream):
 stream = VideoStream(YOUTUBE_URL, FRAME_W, FRAME_H)
 PIXELS_PER_METER = calibrate(stream)
 
-model = YOLO("yolov8n.pt")
+model = YOLO("yolov8l.pt")
 model.to("cuda")
 model(np.zeros((INFER_SIZE, INFER_SIZE, 3), dtype=np.uint8), verbose=False)
 
@@ -134,7 +207,7 @@ scale = INFER_SIZE / max(FRAME_W, FRAME_H)
 infer_w = int(FRAME_W * scale)
 infer_h = int(FRAME_H * scale)
 
-# Measure inference dt
+# Warm up the model (don't use wall-clock time for Kalman — use source FPS)
 warmup_times = []
 dummy = np.zeros((infer_h, infer_w, 3), dtype=np.uint8)
 for _ in range(5):
@@ -142,14 +215,15 @@ for _ in range(5):
     model(dummy, classes=[32], conf=0.25, verbose=False, imgsz=INFER_SIZE)
     warmup_times.append(time.perf_counter() - t0)
 measured_dt = float(np.median(warmup_times))
-print(f"Inference dt: {measured_dt*1000:.1f}ms  ({1/measured_dt:.1f} fps)")
+source_dt = 1.0 / stream.fps  # time between frames in the source video
+print(f"Inference: {measured_dt*1000:.1f}ms wall-clock  |  source FPS: {stream.fps}  =>  frame dt: {source_dt*1000:.1f}ms")
 
-kf = make_kalman(measured_dt)
+kf = make_kalman(source_dt)
 kalman_initialized = False
 trail = deque(maxlen=30)
 speed_history = deque(maxlen=SPEED_SMOOTH_N)
 frame_times = deque(maxlen=30)
-last_t = time.perf_counter()
+tracker_window_created = False
 
 try:
     while True:
@@ -159,14 +233,13 @@ try:
             break
 
         t0 = time.perf_counter()
-        dt = t0 - last_t
-        last_t = t0
 
-        kf.transitionMatrix[0, 2] = dt
-        kf.transitionMatrix[1, 3] = dt
+        # Kalman uses source video dt, not wall-clock — source_dt is fixed per stream FPS
+        kf.transitionMatrix[0, 2] = source_dt
+        kf.transitionMatrix[1, 3] = source_dt
 
         small = cv2.resize(frame, (infer_w, infer_h))
-        results = model(small, classes=[32], conf=0.25, verbose=False, imgsz=INFER_SIZE)
+        results = model(small, classes=[32], conf=0.15, verbose=False, imgsz=INFER_SIZE)
 
         detected = False
         best_cx, best_cy = None, None
@@ -185,6 +258,12 @@ try:
             if dist < best_dist:
                 best_dist = dist
                 best_cx, best_cy = cx, cy
+
+        # Blob fallback: when YOLO finds nothing and Kalman has a prediction,
+        # search a tight window around the predicted position for a bright circular blob.
+        # Constraining to the predicted region avoids false positives on players/markings.
+        if best_cx is None and kalman_initialized:
+            best_cx, best_cy = blob_search(frame, int(pred_x), int(pred_y))
 
         if best_cx is not None:
             measurement = np.array([[np.float32(best_cx)], [np.float32(best_cy)]])
@@ -230,6 +309,10 @@ try:
         cv2.putText(frame, f"{display_fps:.1f} fps  {PIXELS_PER_METER:.1f} px/m", (12, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
+        if not tracker_window_created:
+            cv2.namedWindow("Ball Tracker", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Ball Tracker", DISPLAY_W, DISPLAY_H)
+            tracker_window_created = True
         cv2.imshow("Ball Tracker", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
